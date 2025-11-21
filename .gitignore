@@ -1,0 +1,6 @@
+/target
+*.polkavm
+Cargo.lock
+.DS_Store
+*.log
+deployment-*.json
