@@ -1,0 +1,14 @@
+[package]
+name = "summa"
+version = "0.1.0"
+edition = "2021"
+description = "Homomorphic encryption library for Polkadot PVM"
+license = "MIT"
+
+[dependencies]
+ark-ec = { workspace = true }
+ark-ff = { workspace = true }
+ark-std = { workspace = true }
+ark-serialize = { workspace = true }
+ark-ed-on-bls12-381 = { workspace = true }
+parity-scale-codec = { workspace = true }
