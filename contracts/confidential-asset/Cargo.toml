@@ -1,0 +1,9 @@
+[package]
+name = "confidential-asset"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+summa = { workspace = true }
+polkavm-derive = { workspace = true }
+uapi = { workspace = true }
