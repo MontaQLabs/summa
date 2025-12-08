@@ -1,0 +1,12 @@
+[package]
+name = "gen-ciphertext"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "summa-cli"
+path = "src/main.rs"
+
+[dependencies]
+summa = { workspace = true }
+hex = "0.4"
