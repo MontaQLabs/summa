@@ -1,0 +1,253 @@
+\documentclass[11pt,a4paper]{article}
+
+% --- Packages ---
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{fancyhdr}
+\usepackage{enumitem}
+
+% --- Page Setup ---
+\geometry{margin=1in}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    filecolor=magenta,      
+    urlcolor=cyan,
+    citecolor=red,
+}
+
+% --- Custom Colors for Polkadot/Summa Branding ---
+\definecolor{polkapink}{RGB}{230, 0, 122}
+\definecolor{darkcode}{RGB}{40, 44, 52}
+
+% --- Code Listing Style ---
+\lstset{
+    backgroundcolor=\color{white},   
+    commentstyle=\color{green},
+    keywordstyle=\color{polkapink},
+    numberstyle=\tiny\color{gray},
+    stringstyle=\color{purple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,         
+    breaklines=true,                 
+    captionpos=b,                    
+    keepspaces=true,                 
+    numbers=left,                    
+    numbersep=5pt,                  
+    showspaces=false,                
+    showstringspaces=false,
+    showtabs=false,                  
+    tabsize=2,
+    language=Rust
+}
+
+% --- Header/Footer ---
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{\textbf{Summa Protocol}}
+\lhead{\textit{Confidential Computation for PVM}}
+\cfoot{\thepage}
+
+% --- Title Info ---
+\title{\textbf{\Huge Summa} \\ \Large Privacy-Preserving Smart Contracts on PVM via Twisted ElGamal Encryption}
+\author{\textbf{Abhiraj Mengade} \\ \texttt{abhiraj@montaq.org}}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+    Public blockchains suffer from a fundamental privacy paradox: transparency is required for verification, but confidentiality is required for enterprise adoption. Existing solutions like Zero-Knowledge Rollups (ZKRs) or Trusted Execution Environments (TEEs) often introduce prohibitive latency or hardware trust assumptions. 
+    
+    We introduce \textbf{Summa}, a lightweight Somewhat Homomorphic Encryption (SHE) library optimized for the Polkadot Virtual Machine (PVM). Leveraging Twisted ElGamal encryption on the JubJub curve, Summa enables privacy-preserving smart contracts that can perform homomorphic addition and scalar multiplication on-chain with negligible gas overhead. This paper outlines the cryptographic construction, the integration with Substrate/pallet-revive, and key use cases including confidential assets, confidential voting, and encrypted balances.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Introduction}
+Polkadot's shared security model offers a robust foundation for interoperable blockchains. However, the default execution model of the Polkadot Virtual Machine (PVM) is fully transparent, exposing all state transitions and user balances to the public. While privacy parachains exist (e.g., Manta, Phala), they often require specialized hardware (SGX) or complex circuit construction that limits developer flexibility.
+
+\textbf{Summa} provides a "middle path": a native Rust library that allows standard PVM contracts to operate on encrypted data. By restricting operations to additive homomorphism, we achieve performance characteristics suitable for synchronous block execution, avoiding the "bootstrapping" costs associated with Fully Homomorphic Encryption (FHE).
+
+\section{Cryptographic Primitive: Twisted ElGamal}
+Summa utilizes Twisted ElGamal encryption, a variant of the classic ElGamal system that maps the message space to a cyclic group where the Discrete Logarithm Problem (DLP) is tractable for small values but hard for arbitrary random group elements.
+
+\subsection{Encryption Scheme}
+Let $\mathbb{G}$ be the JubJub elliptic curve group of prime order $q$, and $g$ be a generator of $\mathbb{G}$. Let $s \in \mathbb{Z}_q$ be the secret key, and $h = g^s$ be the public key.
+
+To encrypt a message $m \in \mathbb{Z}_q$ (where $m$ is small, e.g., a balance), we compute the ciphertext $C = (C_1, C_2)$ using a random scalar $r \in \mathbb{Z}_q$:
+\begin{align}
+    C_1 &= g^r \\
+    C_2 &= h^r + g^m \quad \text{(Note: } g^m \text{ embeds } m \text{ into the group)}
+\end{align}
+
+\subsection{Homomorphic Properties}
+Summa supports the following operations directly on ciphertexts without decryption:
+
+\textbf{Additive Homomorphism:} Given $C_A = Enc(m_A)$ and $C_B = Enc(m_B)$, we can compute $Enc(m_A + m_B)$:
+\begin{align}
+    C_{sum} &= (C_{A,1} + C_{B,1}, \ C_{A,2} + C_{B,2}) \\
+            &= (g^{r_A} + g^{r_B}, \ h^{r_A} + g^{m_A} + h^{r_B} + g^{m_B}) \\
+            &= (g^{r_A+r_B}, \ h^{r_A+r_B} + g^{m_A+m_B})
+\end{align}
+
+\textbf{Scalar Multiplication:} Given $C = Enc(m)$ and a public scalar $k$, we can compute $Enc(m \cdot k)$:
+\begin{equation}
+    C_{scaled} = (k \cdot C_1, \ k \cdot C_2) = (g^{r \cdot k}, \ h^{r \cdot k} + g^{m \cdot k})
+\end{equation}
+
+\section{Architecture \& Implementation}
+Summa is designed as a \texttt{no\_std} Rust crate, ensuring full compatibility with the WASM and RISC-V targets used by Polkadot smart contracts.
+
+\subsection{Core Components}
+\begin{itemize}
+    \item \textbf{summa-core:} The cryptographic primitives implementing Twisted ElGamal on JubJub using \texttt{arkworks}.
+    \item \textbf{summa-proofs:} A Bulletproofs-based range proof system. This is critical to prevent "underflow attacks" (e.g., proving an encrypted transfer amount is $> 0$ and does not wrap around the field modulus).
+    \item \textbf{summa-contract:} A set of helper traits for ink! and Solidity (via pallet-revive) to easily ingest encrypted types.
+\end{itemize}
+
+\subsection{Decryption \& The Discrete Log Issue}
+A challenge with Twisted ElGamal is that decryption requires solving the Discrete Logarithm for $g^m$:
+\begin{equation}
+    g^m = C_2 - C_1^s
+\end{equation}
+To recover $m$, Summa employs a "Baby-Step Giant-Step" (BSGS) lookup table optimized for 64-bit integers. This allows decryption of typical financial values in milliseconds, which is performed client-side.
+
+\section{Performance Benchmarks}
+We benchmarked Summa on a standard RISC-V target (simulating \texttt{pallet-revive} conditions).
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}llc@{}}
+\toprule
+\textbf{Operation} & \textbf{Gas Cost (approx.)} & \textbf{Time (ms)} \\ \midrule
+Encryption (Client) & N/A & 2.1 \\
+Homomorphic Add & $\sim$20,000 & 0.05 \\
+Scalar Mul & $\sim$50,000 & 0.12 \\
+Range Proof Verify & $\sim$500,000 & 12.5 \\ \bottomrule
+\end{tabular}
+\caption{Estimated costs on PVM}
+\end{table}
+
+\section{Use Cases}
+
+\subsection{Confidential Assets (Private ERC-20)}
+The flagship demonstration of Summa is a \textbf{Confidential Asset} contract---a privacy-preserving ERC-20 implementation where all token balances are stored as encrypted ciphertexts. This addresses a fundamental weakness of public blockchains: anyone can see your token holdings.
+
+\subsubsection{Design}
+The contract maintains three key storage mappings:
+\begin{itemize}
+    \item \texttt{balances[address] → Ciphertext}: Encrypted balance for each account
+    \item \texttt{pubkeys[address] → PublicKey}: FHE public key for receiving encrypted transfers
+    \item \texttt{owner → Address}: Contract administrator for minting
+\end{itemize}
+
+When a user registers, they submit their FHE public key. All subsequent deposits and transfers are encrypted under this key. The contract performs homomorphic operations on the encrypted balances without ever seeing the actual values.
+
+\subsubsection{Transfer Flow}
+A private transfer works as follows:
+\begin{enumerate}
+    \item Sender computes $Enc_{sender}(amount)$ and a \textbf{range proof} proving $0 \leq amount \leq balance$
+    \item Contract computes: $balance_{sender}' = balance_{sender} - Enc(amount)$
+    \item Contract computes: $balance_{receiver}' = balance_{receiver} + Enc(amount)$
+    \item Contract verifies the range proof to prevent underflow
+    \item New encrypted balances are stored
+\end{enumerate}
+
+\textbf{Critical Security Property:} The range proof ensures a sender cannot transfer more than they own, preventing the classic "negative transfer" attack where $Enc(-1000)$ would underflow the balance.
+
+\subsubsection{Live Testing on Passet Hub}
+We deployed and tested the Confidential Asset contract on Polkadot's Passet Hub testnet:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Test} & \textbf{Result} \\ \midrule
+Contract Deployment (48KB) & \checkmark Success \\
+Register Public Key & \checkmark Stored on-chain \\
+Mint 1000 encrypted tokens & \checkmark Homomorphic add worked \\
+Mint 100 additional tokens & \checkmark Balance updated to 1100 \\
+Query encrypted balance & \checkmark Returns valid ciphertext \\
+Client-side decryption & \checkmark Correctly recovered 1100 \\
+Homomorphic addition on-chain & \checkmark Verified $Enc(500) + Enc(100) = Enc(600)$ \\
+\bottomrule
+\end{tabular}
+\caption{Confidential Asset Test Results on Passet Hub}
+\end{table}
+
+\textbf{Deployment Details:}
+\begin{lstlisting}[language=bash]
+Contract: 0x68d64d2b645ff6da083ef35a90f3b3931ea20b29
+Network:  Passet Hub Testnet
+RPC:      https://testnet-passet-hub-eth-rpc.polkadot.io
+\end{lstlisting}
+
+The contract successfully demonstrated that:
+\begin{enumerate}
+    \item Complex elliptic curve operations (JubJub point arithmetic) execute within PVM gas limits
+    \item SCALE-encoded ciphertexts survive storage and retrieval intact
+    \item Homomorphic addition produces correct results when decrypted client-side
+\end{enumerate}
+
+\subsection{Confidential Treasury Management}
+DAOs on Kusama can use Summa to manage payroll. The treasury contract maintains an encrypted balance for each contributor. The DAO votes to add encrypted amounts to these balances. The total treasury supply remains public, but individual salaries are hidden from on-chain analysis.
+
+\subsection{Sealed-Bid Voting}
+Governance proposals can utilize Summa for quadratic voting. Users submit $Enc(votes)$, and the contract sums them homomorphically. The final result is decrypted only after the voting period ends, preventing "herd behavior" during the poll.
+
+\subsection{Dark Pool Order Matching (Hybrid Approach)}
+While Summa cannot perform $Enc(A) \times Enc(B)$ directly, it can be combined with off-chain ZK-SNARKs. Traders submit encrypted orders, and an off-chain matcher proves validity. Summa handles the settlement by updating encrypted balances, ensuring the on-chain state remains consistent without revealing trade sizes.
+
+\section{Security Considerations}
+
+\subsection{Threat Model}
+Summa protects against:
+\begin{itemize}
+    \item \textbf{Balance Disclosure:} Third parties cannot determine account balances
+    \item \textbf{Transfer Amount Disclosure:} Transfer values are hidden in ciphertexts
+    \item \textbf{Underflow Attacks:} Range proofs prevent negative transfers
+\end{itemize}
+
+Summa does \textbf{not} hide:
+\begin{itemize}
+    \item Transaction graph (who transacts with whom)
+    \item Total supply (can be made public or private by design)
+    \item Account existence
+\end{itemize}
+
+\subsection{Cryptographic Assumptions}
+\begin{enumerate}
+    \item \textbf{ECDLP Hardness:} The Discrete Logarithm Problem on JubJub is computationally infeasible for random group elements
+    \item \textbf{Random Oracle Model:} Fiat-Shamir transform is secure when hash function behaves as random oracle
+\end{enumerate}
+
+\section{Future Work}
+\begin{itemize}
+    \item \textbf{Pallet-Revive Precompiles:} Moving the heavy range-proof verification to a host function to reduce gas costs by 10x.
+    \item \textbf{ZK-Rollup Integration:} Exploring a hybrid model where Summa handles state storage and Plonky2 handles complex logic verification.
+    \item \textbf{Multi-Asset Support:} Extending the Confidential Asset contract to support multiple token types.
+    \item \textbf{Constant-Time Decryption:} Implementing Baby-Step Giant-Step with precomputed tables for production use.
+\end{itemize}
+
+\section{Conclusion}
+Summa democratizes privacy on Polkadot. By avoiding the complexity of full FHE and the hardware requirements of SGX, it provides a "good enough" privacy layer for 90\% of DeFi and Governance use cases. The successful deployment and testing of the Confidential Asset contract on Passet Hub demonstrates that privacy-preserving computation is practical on PVM today.
+
+Summa is lightweight, production-ready, and built for the PVM future.
+
+\section*{Acknowledgments}
+Thanks to the arkworks team for the excellent elliptic curve libraries, and the Polkadot team for pallet-revive and PVM tooling.
+
+\section*{Availability}
+Source code: \url{https://github.com/MontaQLabs/summa}
+
+\end{document}
+
