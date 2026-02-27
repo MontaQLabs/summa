@@ -1,3 +1,5 @@
+cargo-features = ["panic-immediate-abort"]
+
 [workspace]
 resolver = "2"
 members = [
@@ -12,17 +14,20 @@ edition = "2021"
 rust-version = "1.84"
 
 [workspace.dependencies]
-polkavm-derive = { version = "0.26" }
-uapi = { package = "pallet-revive-uapi", version = "0.6", default-features = false }
+polkavm-derive = { version = "0.31.0" }
+uapi = { package = "pallet-revive-uapi", version = "0.10", default-features = false }
 ark-ec = { version = "0.4", default-features = false }
 ark-ff = { version = "0.4", default-features = false }
 ark-std = { version = "0.4", default-features = false }
 ark-serialize = { version = "0.4", default-features = false }
 ark-ed-on-bls12-381 = { version = "0.4", default-features = false }
 parity-scale-codec = { version = "3.6", default-features = false, features = ["derive"] }
+blake2 = { version = "0.10", default-features = false }
+once_cell = { version = "1.20", default-features = false, features = ["alloc"] }
 summa = { path = "summa" }
 
 [profile.release]
 opt-level = "z"
 lto = "thin"
 codegen-units = 16
+panic = "immediate-abort"

@@ -57,6 +57,12 @@ Homomorphic Add:
 
 Without range proofs, an attacker could send `Enc(-1000)` and underflow their balance. Summa includes Bulletproofs-style range proofs that verify `0 ≤ value < 2⁶⁴` without revealing the value.
 
+### Advanced Cryptographic Primitives
+
+- **DLEQ Proofs**: Proves that two elliptic curve points share the same discrete log. Used for nullifier verification.
+- **Shielded Notes**: Support for UTXO-style private transfers using nullifiers to prevent double-spending.
+- **Veil PoP (Proof of Personhood)**: Anonymous enrollment and application verification using one-out-of-many proofs and nullifiers.
+
 ---
 
 ## Use Cases
@@ -73,22 +79,17 @@ let new_balance = old_balance.add_encrypted(&deposit)?;
 let balance = wallet.decrypt(&encrypted_balance)?;
 ```
 
-**Tested on Passet Hub:**
-- Minted encrypted tokens ✓
-- Homomorphic balance updates ✓
-- Client-side decryption ✓
+### 2. Shielded Transfers (UTXO Mode)
 
-### 2. Confidential Treasury
+Move from account-based to note-based privacy. Spend notes anonymously by revealing nullifiers.
 
-DAOs can manage payroll privately. Individual salaries are hidden, but total treasury spend is auditable.
+### 3. Veil PoP: Anonymous Credentials
 
-### 3. Sealed-Bid Voting
+Enroll in a system and later prove membership and application-specific "one-time-use" status without revealing your identity.
+
+### 4. Sealed-Bid Voting
 
 Submit `Enc(votes)` during voting period. Sum homomorphically. Decrypt only after deadline. Prevents herd behavior.
-
-### 4. Dark Pool Settlement
-
-Combine with off-chain ZK proofs for order matching. Summa handles encrypted balance updates on-chain.
 
 ---
 
@@ -125,22 +126,6 @@ export PRIVATE_KEY=0x<your_key>
 ./deploy.sh --network testnet
 ```
 
-### Interact
-
-```bash
-# Generate a keypair
-cargo run -p gen-ciphertext keygen
-
-# Encrypt a value
-cargo run -p gen-ciphertext encrypt --value 1000 --seed 0x<your_seed>
-
-# Decrypt a ciphertext
-cargo run -p gen-ciphertext decrypt <hex_ciphertext> --seed 0x<your_seed>
-
-# Generate contract calldata
-cargo run -p gen-ciphertext calldata mint --to 0x<address> --amount 1000 --seed 0x<your_seed>
-```
-
 ---
 
 ## Project Structure
@@ -153,15 +138,22 @@ summa/
 │   │   ├── keys.rs              # Key generation, encryption, decryption
 │   │   ├── ciphertext.rs        # Homomorphic operations
 │   │   ├── range_proof.rs       # Zero-knowledge range proofs
+│   │   ├── dleq.rs              # DLEQ proofs for nullifiers
+│   │   ├── shielded.rs          # Note/UTXO primitives
+│   │   ├── veil.rs              # Proof of Personhood primitives
 │   │   └── client.rs            # Wallet and calldata utilities
 │   └── README.md
 ├── contracts/
 │   └── confidential-asset/       # Private token contract (PVM)
+│       ├── src/main.rs          # Contract logic with new features
+│       └── Summa.sol            # Solidity router for EVM integration
 ├── tools/
 │   └── gen-ciphertext/           # CLI for encryption/decryption
 ├── docs/
 │   ├── TECHNICAL.md             # Detailed technical documentation
-│   └── paper.tex                # Academic paper (LaTeX)
+│   ├── benchmark.md             # Performance benchmarks
+│   ├── veil.md                  # Veil PoP technical details
+│   └── current.md               # Current development status
 ├── DEPLOYED.md                   # Live deployment addresses
 ├── deploy.sh                     # Multi-network deployment script
 └── Makefile
@@ -169,96 +161,17 @@ summa/
 
 ---
 
-## API Reference
-
-### Library (Rust)
-
-```rust
-use summa::{ConfidentialWallet, Ciphertext};
-
-// Create wallet from 32-byte seed
-let wallet = ConfidentialWallet::from_seed(&seed);
-
-// Get public key (share this for receiving)
-let pubkey = wallet.public_key_bytes();
-
-// Encrypt a value
-let ct = wallet.encrypt_amount(1000, &randomness)?;
-
-// Decrypt (client-side only)
-let value = wallet.decrypt(&ct)?;
-
-// Homomorphic operations (works on-chain!)
-let sum = ct1.add_encrypted(&ct2)?;
-let diff = ct1.sub_encrypted(&ct2)?;
-let scaled = ct.mul_scalar(5)?;
-```
-
-### Contract Functions
-
-| Function | Selector | Description |
-|----------|----------|-------------|
-| `registerPublicKey(bytes32)` | `0x1234abcd` | Register encryption key |
-| `mint(address,bytes)` | `0xaabb1122` | Mint tokens (owner only) |
-| `transfer(address,bytes,bytes)` | `0x5678efab` | Transfer with range proof |
-| `getEncryptedBalance(address)` | `0xdef45678` | Get encrypted balance |
-| `owner()` | `0x8da5cb5b` | Get contract owner |
-| `transferOwnership(address)` | `0xf2fde38b` | Transfer ownership |
-
----
-
 ## Performance
+
+Detailed benchmarks are available in [docs/benchmark.md](docs/benchmark.md).
 
 | Operation | Gas (approx.) | Time |
 |-----------|---------------|------|
 | Encryption (client) | N/A | ~2ms |
 | Homomorphic Add | ~20,000 | ~0.05ms |
-| Scalar Multiply | ~50,000 | ~0.12ms |
 | Range Proof Verify | ~500,000 | ~12ms |
-| Decryption (client) | N/A | ~50ms |
-
-Contract size: ~48KB
-
----
-
-## Security Considerations
-
-**Cryptographic Assumptions:**
-- Discrete Log Problem on JubJub is hard
-- Fiat-Shamir heuristic (random oracle model)
-
-**What's Protected:**
-- Individual balances (encrypted)
-- Transfer amounts (encrypted + range proved)
-
-**What's Public:**
-- Transaction graph (who transacts with whom)
-- Total supply
-- Contract state structure
-
-**Production Checklist:**
-- [ ] Replace simple hash with Blake2b/Poseidon
-- [ ] Implement Baby-Step Giant-Step for constant-time decryption
-- [ ] External security audit
-- [ ] Formal verification of range proofs
-
----
-
-## Documentation
-
-- **[Technical Documentation](docs/TECHNICAL.md)** - Deep dive into cryptography and architecture
-- **[Academic Paper](docs/paper.tex)** - LaTeX paper with formal definitions
-
----
-
-## Contributing
-
-Contributions welcome! Please read our contributing guidelines.
-
-1. Fork the repository
-2. Create a feature branch
-3. Commit your changes
-4. Open a Pull Request
+| Enrollment Proof | ~1,200,000 | ~25ms |
+| Application Proof | ~1,500,000 | ~32ms |
 
 ---
 

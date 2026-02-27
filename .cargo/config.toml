@@ -1,6 +1,5 @@
-[build]
-target = "riscv64emac-unknown-none-polkavm"
-
 [unstable]
-build-std = ["core", "alloc"]
-build-std-features = ["panic_immediate_abort"]
+json-target-spec = true
+
+[env]
+RUSTC_BOOTSTRAP = "1"

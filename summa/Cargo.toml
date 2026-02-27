@@ -12,3 +12,8 @@ ark-std = { workspace = true }
 ark-serialize = { workspace = true }
 ark-ed-on-bls12-381 = { workspace = true }
 parity-scale-codec = { workspace = true }
+blake2 = { workspace = true }
+once_cell = { workspace = true }
+
+[dev-dependencies]
+hex = "0.4"

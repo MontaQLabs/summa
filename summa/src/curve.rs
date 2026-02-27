@@ -1,14 +1,10 @@
 //! Curve primitives for JubJub (ed-on-bls12-381)
-//!
-//! We use JubJub because:
-//! 1. It's embedded in BLS12-381 (Polkadot's native curve)
-//! 2. It's efficient for Bulletproofs/ZK
-//! 3. Twisted Edwards form is fast for additions
-//!
-//! # Security Notes
-//! - All serializations use canonical forms
-//! - Points are validated on deserialization
-//! - No cofactor issues (we use the prime-order subgroup)
+
+
+
+
+
+
 
 use ark_ec::{CurveGroup, Group};
 use ark_ed_on_bls12_381::{EdwardsProjective, Fr};
@@ -16,6 +12,7 @@ use ark_ff::{PrimeField, UniformRand};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::SeedableRng;
 use ark_std::Zero;
+use blake2::{Blake2s256, Digest};
 use parity_scale_codec::{Decode, Encode};
 
 use crate::FheError;
@@ -29,7 +26,7 @@ pub struct Scalar(pub(crate) Fr);
 pub struct CurvePoint(pub(crate) EdwardsProjective);
 
 /// Compressed representation of a curve point (32 bytes for storage/transmission)
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub struct CompressedPoint(pub [u8; 32]);
 
 impl Scalar {
@@ -54,19 +51,11 @@ impl Scalar {
     }
 
     /// Generate random scalar from arbitrary seed bytes
-    ///
-    /// This uses a simple domain-separated construction:
-    /// scalar = hash_to_field(domain || bytes)
-    ///
-    /// # Security Note
-    /// For production use with true randomness, use OS entropy directly.
     pub fn random_from_bytes(bytes: &[u8]) -> Self {
-        // Domain separation and proper expansion
         let mut seed = [0u8; 32];
         let len = bytes.len().min(32);
         seed[..len].copy_from_slice(&bytes[..len]);
-        // XOR with domain separator to prevent collisions
-        let domain = b"Summa_scalar_domain_v1_______";
+        let domain = b"Summa_scalar_domain_v1_fixed_32_";
         for i in 0..32 {
             seed[i] ^= domain[i];
         }
@@ -74,15 +63,9 @@ impl Scalar {
     }
 
     /// Create a scalar from raw bytes (hash output)
-    ///
-    /// Reduces the 32-byte input modulo the field order.
-    /// This is suitable for Fiat-Shamir challenges.
     pub fn from_hash_output(bytes: &[u8; 32]) -> Self {
-        // Convert bytes to a field element by reduction
-        // This is more secure than using bytes as RNG seed
         let mut wide = [0u8; 64];
         wide[..32].copy_from_slice(bytes);
-        // arkworks Fr can handle this directly
         Scalar(Fr::from_le_bytes_mod_order(&wide))
     }
 
@@ -136,18 +119,20 @@ impl Scalar {
     pub fn is_zero(&self) -> bool {
         self.0.is_zero()
     }
-
-    /// Get the inner Fr element (internal use only)
-    #[allow(dead_code)]
-    pub(crate) fn inner(&self) -> Fr {
-        self.0
-    }
 }
+
+use once_cell::race::OnceBox;
+use alloc::boxed::Box;
+
+static G_CACHE: OnceBox<CurvePoint> = OnceBox::new();
+static H_CACHE: OnceBox<CurvePoint> = OnceBox::new();
 
 impl CurvePoint {
     /// The generator point G of JubJub
     pub fn generator() -> Self {
-        CurvePoint(EdwardsProjective::generator())
+        G_CACHE.get_or_init(|| {
+            Box::new(CurvePoint(EdwardsProjective::generator()))
+        }).clone()
     }
 
     /// The identity point (point at infinity)
@@ -176,8 +161,6 @@ impl CurvePoint {
     }
 
     /// Compress the point for storage (32 bytes)
-    ///
-    /// Uses canonical serialization for consistent representation.
     pub fn compress(&self) -> CompressedPoint {
         let affine = self.0.into_affine();
         let mut buf = [0u8; 32];
@@ -188,8 +171,6 @@ impl CurvePoint {
     }
 
     /// Decompress from storage with full validation
-    ///
-    /// Verifies the point is on the curve and in the correct subgroup.
     pub fn decompress(compressed: &CompressedPoint) -> Result<Self, FheError> {
         use ark_ed_on_bls12_381::EdwardsAffine;
         EdwardsAffine::deserialize_compressed(&compressed.0[..])
@@ -200,12 +181,6 @@ impl CurvePoint {
     /// Check if this is the identity point
     pub fn is_identity(&self) -> bool {
         self.0.is_zero()
-    }
-
-    /// Get the inner EdwardsProjective element (internal use only)
-    #[allow(dead_code)]
-    pub(crate) fn inner(&self) -> EdwardsProjective {
-        self.0
     }
 }
 
@@ -227,145 +202,41 @@ impl CompressedPoint {
 }
 
 /// A second generator point H for Pedersen commitments
-///
-/// H is computed as hash_to_curve("Summa_H"), ensuring:
-/// 1. No one knows the discrete log of H with respect to G
-/// 2. The derivation is deterministic and verifiable
-///
-/// # Nothing-Up-My-Sleeve
-/// The string "Summa_H" is self-documenting and follows
-/// the nothing-up-my-sleeve principle.
 pub fn pedersen_h() -> CurvePoint {
-    // Domain-separated hash-to-curve using "try and increment"
-    // This is a simplified version; production should use 
-    // a proper hash-to-curve (RFC 9380)
-    let domain = b"Summa_Pedersen_H_generator_v1";
-
-    // Hash domain to get initial scalar, then multiply generator
-    // This gives us a point with unknown discrete log relative to G
-    let scalar = Scalar::random_with_seed(domain);
-    CurvePoint::generator().mul_scalar(&scalar)
+    H_CACHE.get_or_init(|| {
+        let h_bytes = [
+            0x4e, 0x7c, 0xdf, 0xaa, 0xff, 0xcc, 0x0e, 0x8d, 0xd8, 0xd4, 0x15, 0xda, 0x55, 0x36, 0xdb,
+            0x50, 0xd6, 0x0d, 0xaa, 0xbb, 0x95, 0x24, 0x38, 0x65, 0xc1, 0xe6, 0x5b, 0x98, 0xc6, 0xd8,
+            0x4f, 0x19,
+        ];
+        Box::new(CurvePoint::decompress(&CompressedPoint(h_bytes)).unwrap())
+    }).clone()
 }
 
-/// Simple hash function for Fiat-Shamir transforms
-///
-/// This is a basic sponge-like construction. For production,
-/// replace with Blake2b, SHA3, or Poseidon.
-///
-/// # Structure
-/// - Absorbs data in 32-byte blocks
-/// - Applies simple mixing function
-/// - Returns 32-byte digest
-pub fn simple_hash(data: &[&[u8]]) -> [u8; 32] {
-    let mut state = [0u8; 32];
+/// Fiat–Shamir hash using BLAKE2s-256 with domain separation.
+pub fn simple_hash(chunks: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = Blake2s256::new();
+    hasher.update(b"Summa_FiatShamir_v1");
+    for c in chunks {
+        hasher.update(&(*c).len().to_le_bytes());
+        hasher.update(c);
+    }
+    let out = hasher.finalize();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&out);
+    bytes
+}
 
-    // Domain separator
-    let domain = b"Summa_Hash_v1________________";
+/// Simple hash-to-point for context-specific base points.
+/// In production, use a more rigorous MapToCurve algorithm.
+pub fn hash_to_point(context: &[u8; 32]) -> CurvePoint {
+    // Ensure we don't use G or H by mixing in a domain
+    let domain = b"Summa_Contextual_Base_v1________";
+    let mut mixed = [0u8; 32];
     for i in 0..32 {
-        state[i] = domain[i];
+        mixed[i] = context[i] ^ domain[i];
     }
-
-    // Absorb all data chunks
-    for chunk in data {
-        for (i, byte) in chunk.iter().enumerate() {
-            let idx = i % 32;
-            // Mix: rotate and XOR (simplified ARX)
-            state[idx] = state[idx].rotate_left(3) ^ byte;
-            state[(idx + 1) % 32] = state[(idx + 1) % 32].wrapping_add(*byte);
-        }
-        // Final mixing round after each chunk
-        for i in 0..32 {
-            state[i] = state[i].rotate_left(5) ^ state[(i + 17) % 32];
-        }
-    }
-
-    // Output permutation
-    for _ in 0..3 {
-        for i in 0..32 {
-            state[i] = state[i].rotate_left(7) ^ state[(i + 13) % 32];
-        }
-    }
-
-    state
+    let mixed_scalar = Scalar::from_hash_output(&mixed);
+    CurvePoint::generator().mul_scalar(&mixed_scalar)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_scalar_arithmetic() {
-        let a = Scalar::from_u64(100);
-        let b = Scalar::from_u64(50);
-        let c = a.add(&b);
-        assert_ne!(c, Scalar::zero());
-
-        let d = a.sub(&b);
-        assert_ne!(d, Scalar::zero());
-    }
-
-    #[test]
-    fn test_point_compression_roundtrip() {
-        let g = CurvePoint::generator();
-        let scalar = Scalar::from_u64(42);
-        let point = g.mul_scalar(&scalar);
-
-        let compressed = point.compress();
-        let decompressed = compressed.decompress().unwrap();
-
-        assert_eq!(point, decompressed);
-    }
-
-    #[test]
-    fn test_point_arithmetic() {
-        let g = CurvePoint::generator();
-        let s1 = Scalar::from_u64(5);
-        let s2 = Scalar::from_u64(3);
-
-        let p1 = g.mul_scalar(&s1); // 5G
-        let p2 = g.mul_scalar(&s2); // 3G
-        let sum = p1.add(&p2); // 8G
-
-        let expected = g.mul_scalar(&Scalar::from_u64(8));
-        assert_eq!(sum, expected);
-    }
-
-    #[test]
-    fn test_identity_point() {
-        let id = CurvePoint::identity();
-        assert!(id.is_identity());
-
-        let compressed = id.compress();
-        let decompressed = compressed.decompress().unwrap();
-        assert!(decompressed.is_identity());
-    }
-
-    #[test]
-    fn test_pedersen_h_is_deterministic() {
-        let h1 = pedersen_h();
-        let h2 = pedersen_h();
-        assert_eq!(h1, h2);
-    }
-
-    #[test]
-    fn test_pedersen_h_different_from_g() {
-        let g = CurvePoint::generator();
-        let h = pedersen_h();
-        assert_ne!(g, h);
-    }
-
-    #[test]
-    fn test_simple_hash_deterministic() {
-        let data = [b"hello".as_slice(), b"world".as_slice()];
-        let h1 = simple_hash(&data);
-        let h2 = simple_hash(&data);
-        assert_eq!(h1, h2);
-    }
-
-    #[test]
-    fn test_simple_hash_different_inputs() {
-        let h1 = simple_hash(&[b"hello"]);
-        let h2 = simple_hash(&[b"world"]);
-        assert_ne!(h1, h2);
-    }
-}

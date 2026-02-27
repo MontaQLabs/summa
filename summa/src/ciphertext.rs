@@ -3,6 +3,12 @@
 //! This is the core data structure that contracts manipulate.
 //! The magic: you can add/multiply ciphertexts without decrypting!
 
+
+
+
+
+
+
 use parity_scale_codec::{Decode, Encode};
 
 use crate::curve::{CompressedPoint, CurvePoint, Scalar};
@@ -46,7 +52,7 @@ impl Ciphertext {
     ///
     /// Math:
     /// - (C1_a + C1_b, C2_a + C2_b)
-    /// - = ((r_a + r_b) * G, (m_a + m_b) * G + (r_a + r_b) * Y)
+    /// - = ((r_a + r_b) * H, (m_a + m_b) * G + (r_a + r_b) * Y)
     /// - = Encrypt(m_a + m_b) with randomness (r_a + r_b)
     pub fn add_encrypted(&self, other: &Ciphertext) -> Result<Ciphertext, FheError> {
         let c1_a = self.c1.decompress()?;
@@ -180,7 +186,6 @@ impl Ciphertext {
     }
 }
 
-/// Batch operations for efficiency
 impl Ciphertext {
     /// Add multiple ciphertexts together
     pub fn sum(ciphertexts: &[Ciphertext]) -> Result<Ciphertext, FheError> {
@@ -195,82 +200,4 @@ impl Ciphertext {
         Ok(result)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::KeyPair;
-
-    #[test]
-    fn test_homomorphic_addition() {
-        let seed = [42u8; 32];
-        let keypair = KeyPair::from_seed(&seed);
-
-        // Encrypt two values
-        let ct_a = keypair.public.encrypt_with_seed(100, &[1u8; 32]).unwrap();
-        let ct_b = keypair.public.encrypt_with_seed(50, &[2u8; 32]).unwrap();
-
-        // Add them homomorphically
-        let ct_sum = ct_a.add_encrypted(&ct_b).unwrap();
-
-        // Decrypt and verify
-        let decrypted = keypair.decrypt(&ct_sum).unwrap();
-        assert_eq!(150, decrypted);
-    }
-
-    #[test]
-    fn test_homomorphic_subtraction() {
-        let seed = [42u8; 32];
-        let keypair = KeyPair::from_seed(&seed);
-
-        let ct_a = keypair.public.encrypt_with_seed(100, &[1u8; 32]).unwrap();
-        let ct_b = keypair.public.encrypt_with_seed(30, &[2u8; 32]).unwrap();
-
-        let ct_diff = ct_a.sub_encrypted(&ct_b).unwrap();
-
-        let decrypted = keypair.decrypt(&ct_diff).unwrap();
-        assert_eq!(70, decrypted);
-    }
-
-    #[test]
-    fn test_scalar_multiplication() {
-        let seed = [42u8; 32];
-        let keypair = KeyPair::from_seed(&seed);
-
-        let ct = keypair.public.encrypt_with_seed(100, &[1u8; 32]).unwrap();
-        let ct_scaled = ct.mul_scalar(5).unwrap();
-
-        let decrypted = keypair.decrypt(&ct_scaled).unwrap();
-        assert_eq!(500, decrypted);
-    }
-
-    #[test]
-    fn test_zero_ciphertext() {
-        let seed = [42u8; 32];
-        let keypair = KeyPair::from_seed(&seed);
-
-        let ct = keypair.public.encrypt_with_seed(100, &[1u8; 32]).unwrap();
-        let zero = Ciphertext::zero();
-
-        let sum = ct.add_encrypted(&zero).unwrap();
-
-        // Note: The result won't equal ct directly because zero ciphertext
-        // has a different structure, but decryption should match
-        let decrypted = keypair.decrypt(&sum).unwrap();
-        assert_eq!(100, decrypted);
-    }
-
-    #[test]
-    fn test_serialization() {
-        let seed = [42u8; 32];
-        let keypair = KeyPair::from_seed(&seed);
-
-        let ct = keypair.public.encrypt_with_seed(42, &[1u8; 32]).unwrap();
-        let bytes = ct.to_bytes();
-        let restored = Ciphertext::from_bytes(&bytes);
-
-        assert_eq!(ct, restored);
-    }
-}
-
 

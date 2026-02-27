@@ -1,78 +1,28 @@
-//! # Confidential Asset Contract
-//!
-//! A private ERC-20 style token where balances are encrypted!
-//! The contract manipulates balances without ever seeing the actual values.
-//!
-//! ## Features
-//! - **Private Balances**: All balances stored as encrypted ciphertexts
-//! - **Homomorphic Transfers**: Add/subtract encrypted amounts directly
-//! - **Range Proofs**: Prevent underflow attacks (no printing money!)
-//! - **Re-randomization**: Break transaction linkability
-//! - **Access Control**: Owner-based admin functions
-//!
-//! ## ABI (Solidity-compatible)
-//! ```solidity
-//! interface IConfidentialAsset {
-//!     function registerPublicKey(bytes32 publicKey) external;
-//!     function transfer(address to, bytes calldata encryptedAmount, bytes calldata proof) external;
-//!     function deposit(bytes calldata encryptedAmount) external payable;
-//!     function getEncryptedBalance(address account) external view returns (bytes memory);
-//!     function mint(address to, bytes calldata encryptedAmount) external; // owner only
-//!     function transferOwnership(address newOwner) external; // owner only
-//! }
-//! ```
-//!
-//! ## Security Considerations
-//! - Range proofs MUST be verified for all transfers
-//! - Public keys MUST be registered before receiving funds
-//! - Owner can mint but cannot see balances
-//! - All cryptographic operations use constant-time implementations
-
+//! Confidential Asset contract using embedded Summa FHE library.
 #![no_main]
 #![no_std]
 
 extern crate alloc;
 
-use alloc::vec::Vec;
-use summa::{Ciphertext, Decode, Encode, PublicKey, TransferProof};
 use uapi::{HostFn, HostFnImpl as api, ReturnFlags, StorageFlags};
+use summa::{Ciphertext, Decode, Encode, EqualityProof, PublicKey, TransferProof, AffineUpdateProof, EnrollmentNullifier, ApplicationNullifier, RangeProof};
 
-// ============================================================================
-// Panic Handler (required for no_std)
-// ============================================================================
-
+// Panic handler
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    // In production, consider logging the panic before halting
     unsafe {
         core::arch::asm!("unimp");
         core::hint::unreachable_unchecked();
     }
 }
 
-// ============================================================================
-// Global Allocator (required for alloc crate)
-// ============================================================================
-
-/// Simple bump allocator for no_std environment
-///
-/// # Limitations
-/// - Does not deallocate (suitable for short-lived contract calls)
-/// - Fixed heap size (64KB)
-///
-/// # Production Recommendations
-/// - Use `wee_alloc` for smaller code size
-/// - Use `dlmalloc` for production-grade allocation
-/// - Consider custom allocator with memory limits
+// Simple bump allocator for no_std
 struct BumpAllocator;
 
 #[global_allocator]
 static ALLOCATOR: BumpAllocator = BumpAllocator;
 
-/// Heap size: 64KB
-/// Adjust based on expected proof sizes and concurrent operations
 const HEAP_SIZE: usize = 65536;
-
 static mut HEAP: [u8; HEAP_SIZE] = [0u8; HEAP_SIZE];
 static mut HEAP_POS: usize = 0;
 
@@ -81,107 +31,74 @@ unsafe impl core::alloc::GlobalAlloc for BumpAllocator {
         let align = layout.align();
         let size = layout.size();
 
-        // Align the current position
-        let aligned_pos = (HEAP_POS + align - 1) & !(align - 1);
+        let aligned_pos = (unsafe { HEAP_POS } + align - 1) & !(align - 1);
         let new_pos = aligned_pos + size;
 
-        if new_pos > HEAP.len() {
-            // Out of memory - return null
+        if new_pos > HEAP_SIZE {
             core::ptr::null_mut()
         } else {
-            HEAP_POS = new_pos;
-            HEAP.as_mut_ptr().add(aligned_pos)
+            unsafe { HEAP_POS = new_pos };
+            (core::ptr::addr_of_mut!(HEAP) as *mut u8).add(aligned_pos)
         }
     }
 
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {
-        // Bump allocator doesn't deallocate
-        // Memory is "freed" when the contract call ends
+        // bump allocator: no deallocation
     }
 }
 
-// ============================================================================
-// Storage Keys
-// ============================================================================
-
-/// Storage key prefix for encrypted balances
-/// Derived from: keccak256("summa.balance")[:4]
+// Storage keys
 const BALANCE_PREFIX: [u8; 4] = [0xba, 0x1a, 0x2c, 0xe0];
-
-/// Storage key prefix for public keys
-/// Derived from: keccak256("summa.pubkey")[:4]
 const PUBKEY_PREFIX: [u8; 4] = [0x9b, 0x3f, 0x7a, 0x21];
-
-/// Storage key for total supply (also encrypted!)
-/// Full 32-byte key for isolation
+const NOTE_PREFIX: [u8; 4] = [0x6e, 0x6f, 0x74, 0x65]; // "note"
+const NULLIFIER_PREFIX: [u8; 4] = [0x6e, 0x75, 0x6c, 0x6c]; // "null"
 const TOTAL_SUPPLY_KEY: [u8; 32] = [
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x74, 0x6f, 0x74, 0x61, 0x6c, 0x5f, 0x73, 0x70, // "total_sp"
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x74, 0x6f, 0x74, 0x61, 0x6c, 0x5f,
+    0x73, 0x70,
 ];
-
-/// Storage key for contract owner
-/// Derived from: keccak256("summa.owner")
 const OWNER_KEY: [u8; 32] = [
-    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
-    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x6f, 0x77, 0x6e, 0x65, 0x72, 0x5f, 0x5f, 0x5f, // "owner___"
+    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+    0xaa, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6f, 0x77, 0x6e, 0x65, 0x72, 0x5f,
+    0x5f, 0x5f,
 ];
 
-// ============================================================================
-// Function Selectors (Solidity ABI)
-// ============================================================================
-
-/// registerPublicKey(bytes32): 0x1234abcd
+// Function selectors
 const SELECTOR_REGISTER_PUBKEY: [u8; 4] = [0x12, 0x34, 0xab, 0xcd];
-
-/// transfer(address,bytes,bytes): 0x5678efab
 const SELECTOR_TRANSFER: [u8; 4] = [0x56, 0x78, 0xef, 0xab];
-
-/// deposit(bytes): 0x9abc0123
 const SELECTOR_DEPOSIT: [u8; 4] = [0x9a, 0xbc, 0x01, 0x23];
-
-/// getEncryptedBalance(address): 0xdef45678
 const SELECTOR_GET_BALANCE: [u8; 4] = [0xde, 0xf4, 0x56, 0x78];
-
-/// mint(address,bytes): 0xaabb1122 (owner only)
 const SELECTOR_MINT: [u8; 4] = [0xaa, 0xbb, 0x11, 0x22];
-
-/// transferOwnership(address): 0xf2fde38b
 const SELECTOR_TRANSFER_OWNERSHIP: [u8; 4] = [0xf2, 0xfd, 0xe3, 0x8b];
-
-/// owner(): 0x8da5cb5b
 const SELECTOR_OWNER: [u8; 4] = [0x8d, 0xa5, 0xcb, 0x5b];
+// totalSupply(): 0x18160ddd (ERC-20 standard)
+const SELECTOR_TOTAL_SUPPLY: [u8; 4] = [0x18, 0x16, 0x0d, 0xdd];
 
-// ============================================================================
-// Storage Helper Functions
-// ============================================================================
+const SELECTOR_TRANSFER_SPLIT: [u8; 4] = [0x77, 0x88, 0x99, 0xaa];
+const SELECTOR_MINT_NOTE: [u8; 4] = [0xbb, 0xcc, 0xdd, 0xee];
+const SELECTOR_SPEND_NOTE: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+const SELECTOR_APPLY_AFFINE: [u8; 4] = [0x55, 0x66, 0x77, 0x88];
 
-/// Read from storage, returns true if key exists
+// Veil PoP Primitives
+const SELECTOR_VERIFY_ENROLLMENT: [u8; 4] = [0x33, 0x44, 0x55, 0x66];
+const SELECTOR_VERIFY_APPLICATION: [u8; 4] = [0x77, 0x88, 0xaa, 0xbb];
+const SELECTOR_VERIFY_THRESHOLD: [u8; 4] = [0xcc, 0xdd, 0xee, 0xff];
+
 fn storage_get(key: &[u8; 32], output: &mut [u8]) -> bool {
     let mut out_slice: &mut [u8] = output;
     api::get_storage(StorageFlags::empty(), key, &mut out_slice).is_ok()
 }
 
-/// Write to storage
 fn storage_set(key: &[u8; 32], value: &[u8]) {
     api::set_storage(StorageFlags::empty(), key, value);
 }
 
-/// Check if storage key exists
 fn storage_exists(key: &[u8; 32]) -> bool {
     let mut buf = [0u8; 1];
     let mut out: &mut [u8] = &mut buf;
     api::get_storage(StorageFlags::empty(), key, &mut out).is_ok()
 }
 
-// ============================================================================
-// Access Control
-// ============================================================================
-
-/// Get the current contract owner
 fn get_owner() -> Option<[u8; 20]> {
     let mut owner_bytes = [0u8; 20];
     if storage_get(&OWNER_KEY, &mut owner_bytes) {
@@ -191,12 +108,10 @@ fn get_owner() -> Option<[u8; 20]> {
     }
 }
 
-/// Set the contract owner (internal use only)
 fn set_owner(owner: &[u8; 20]) {
     storage_set(&OWNER_KEY, owner);
 }
 
-/// Check if caller is the owner, revert if not
 fn require_owner() {
     let mut caller = [0u8; 20];
     api::caller(&mut caller);
@@ -208,32 +123,21 @@ fn require_owner() {
     }
 }
 
-// ============================================================================
-// Contract Entry Points
-// ============================================================================
-
-/// Constructor - called once when contract is deployed
-///
-/// Sets the deployer as the initial owner and initializes total supply.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[polkavm_derive::polkavm_export]
 pub extern "C" fn deploy() {
-    // Set deployer as owner
     let mut deployer = [0u8; 20];
     api::caller(&mut deployer);
     set_owner(&deployer);
 
-    // Initialize total supply to zero (encrypted)
     let zero_balance = Ciphertext::zero();
     let encoded = zero_balance.encode();
     storage_set(&TOTAL_SUPPLY_KEY, &encoded);
 }
 
-/// Main entry point - routes to appropriate function
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[polkavm_derive::polkavm_export]
 pub extern "C" fn call() {
-    // Read function selector (first 4 bytes)
     let mut selector = [0u8; 4];
     api::call_data_copy(&mut selector, 0);
 
@@ -245,39 +149,34 @@ pub extern "C" fn call() {
         SELECTOR_MINT => handle_mint(),
         SELECTOR_TRANSFER_OWNERSHIP => handle_transfer_ownership(),
         SELECTOR_OWNER => handle_get_owner(),
+        SELECTOR_TOTAL_SUPPLY => handle_total_supply(),
+        SELECTOR_TRANSFER_SPLIT => handle_transfer_split(),
+        SELECTOR_MINT_NOTE => handle_mint_note(),
+        SELECTOR_SPEND_NOTE => handle_spend_note(),
+        SELECTOR_APPLY_AFFINE => handle_apply_affine(),
+        SELECTOR_VERIFY_ENROLLMENT => handle_verify_enrollment(),
+        SELECTOR_VERIFY_APPLICATION => handle_verify_application(),
+        SELECTOR_VERIFY_THRESHOLD => handle_verify_threshold(),
         _ => revert_with_message(b"Unknown selector"),
     }
 }
 
-// ============================================================================
-// Handler Functions
-// ============================================================================
-
-/// Register a public key for an account
-///
-/// This is needed so others can encrypt amounts destined for this account.
-/// Each account MUST register before receiving private transfers.
 fn handle_register_pubkey() {
-    // Get caller address
     let mut caller = [0u8; 20];
     api::caller(&mut caller);
 
-    // Read public key from calldata (32 bytes after selector)
     let mut pubkey_bytes = [0u8; 32];
     api::call_data_copy(&mut pubkey_bytes, 4);
 
-    // Validate public key is a valid curve point
     let pubkey = PublicKey::from_bytes(pubkey_bytes);
     if pubkey.to_point().is_err() {
         revert_with_message(b"Invalid public key");
         return;
     }
 
-    // Store public key
     let key = make_pubkey_key(&caller);
     storage_set(&key, &pubkey_bytes);
 
-    // Initialize balance to zero if not exists
     let balance_key = make_balance_key(&caller);
     if !storage_exists(&balance_key) {
         let zero = Ciphertext::zero();
@@ -285,32 +184,16 @@ fn handle_register_pubkey() {
         storage_set(&balance_key, &encoded);
     }
 
-    // Return success
     api::return_value(ReturnFlags::empty(), &[1u8]);
 }
 
-/// Transfer encrypted tokens to another account
-///
-/// The magic happens here:
-/// 1. Subtract encrypted amount from sender (homomorphic subtraction)
-/// 2. Add encrypted amount to receiver (homomorphic addition)
-/// 3. Verify range proof (sender can't go negative)
-///
-/// THE CONTRACT NEVER KNOWS THE ACTUAL AMOUNTS!
 fn handle_transfer() {
     let mut caller = [0u8; 20];
     api::caller(&mut caller);
 
-    // Parse calldata:
-    // [4..24]: recipient (20 bytes)
-    // [24..88]: encrypted amount (64 bytes = Ciphertext)
-    // [88..92]: proof length (4 bytes)
-    // [92..]: transfer proof (variable)
-
     let mut recipient = [0u8; 20];
     api::call_data_copy(&mut recipient, 4);
 
-    // Prevent self-transfer (potential attack vector)
     if recipient == caller {
         revert_with_message(b"Cannot self-transfer");
         return;
@@ -320,14 +203,11 @@ fn handle_transfer() {
     api::call_data_copy(&mut amount_bytes, 24);
     let encrypted_amount = Ciphertext::from_bytes(&amount_bytes);
 
-    // Read proof length and data
     let mut proof_len_bytes = [0u8; 4];
     api::call_data_copy(&mut proof_len_bytes, 88);
     let proof_len = u32::from_be_bytes(proof_len_bytes) as usize;
 
-    // Sanity check proof length (prevent DoS)
     if proof_len > 16384 {
-        // 16KB max proof size
         revert_with_message(b"Proof too large");
         return;
     }
@@ -335,7 +215,6 @@ fn handle_transfer() {
     let mut proof_data = alloc::vec![0u8; proof_len];
     api::call_data_copy(&mut proof_data, 92);
 
-    // Decode transfer proof
     let transfer_proof = match TransferProof::decode(&mut &proof_data[..]) {
         Ok(p) => p,
         Err(_) => {
@@ -344,7 +223,6 @@ fn handle_transfer() {
         }
     };
 
-    // Get sender's current balance
     let sender_balance_key = make_balance_key(&caller);
     let mut sender_balance_bytes = [0u8; 128];
     if !storage_get(&sender_balance_key, &mut sender_balance_bytes) {
@@ -360,7 +238,6 @@ fn handle_transfer() {
         }
     };
 
-    // Get sender's public key for proof verification
     let sender_pubkey_key = make_pubkey_key(&caller);
     let mut sender_pubkey_bytes = [0u8; 32];
     if !storage_get(&sender_pubkey_key, &mut sender_pubkey_bytes) {
@@ -369,18 +246,12 @@ fn handle_transfer() {
     }
     let sender_pubkey = PublicKey::from_bytes(sender_pubkey_bytes);
 
-    // Verify recipient is registered
     let receiver_pubkey_key = make_pubkey_key(&recipient);
     if !storage_exists(&receiver_pubkey_key) {
         revert_with_message(b"Recipient not registered");
         return;
     }
 
-    // =========================================================================
-    // THE HOMOMORPHIC MAGIC: Compute new balances without knowing values!
-    // =========================================================================
-
-    // New sender balance = old balance - amount
     let new_sender_balance = match sender_balance.sub_encrypted(&encrypted_amount) {
         Ok(ct) => ct,
         Err(_) => {
@@ -389,21 +260,14 @@ fn handle_transfer() {
         }
     };
 
-    // CRITICAL: Verify range proof
-    // This proves new_sender_balance >= 0 (no underflow/money printing!)
     match transfer_proof.verify(&encrypted_amount, &new_sender_balance, &sender_pubkey) {
         Ok(true) => {}
-        Ok(false) => {
+        _ => {
             revert_with_message(b"Range proof invalid");
-            return;
-        }
-        Err(_) => {
-            revert_with_message(b"Proof verification error");
             return;
         }
     }
 
-    // Get receiver's balance
     let receiver_balance_key = make_balance_key(&recipient);
     let mut receiver_balance_bytes = [0u8; 128];
     let receiver_balance = if storage_get(&receiver_balance_key, &mut receiver_balance_bytes) {
@@ -415,7 +279,6 @@ fn handle_transfer() {
         Ciphertext::zero()
     };
 
-    // New receiver balance = old balance + amount
     let new_receiver_balance = match receiver_balance.add_encrypted(&encrypted_amount) {
         Ok(ct) => ct,
         Err(_) => {
@@ -424,33 +287,19 @@ fn handle_transfer() {
         }
     };
 
-    // =========================================================================
-    // Update storage (both must succeed atomically)
-    // =========================================================================
-
     storage_set(&sender_balance_key, &new_sender_balance.encode());
     storage_set(&receiver_balance_key, &new_receiver_balance.encode());
-
-    // TODO: Emit Transfer event using api::deposit_event()
-    // Event would contain: sender, recipient, encrypted_amount
 
     api::return_value(ReturnFlags::empty(), &[1u8]);
 }
 
-/// Deposit native tokens and receive encrypted tokens
-///
-/// This is the "on-ramp" from public to private.
-/// The deposit amount is public (native token), but the encrypted
-/// representation hides it in subsequent operations.
 fn handle_deposit() {
     let mut caller = [0u8; 20];
     api::caller(&mut caller);
 
-    // Get the deposited value (this IS public - it's the native token amount)
     let mut value_bytes = [0u8; 32];
     api::value_transferred(&mut value_bytes);
 
-    // Convert to u64 (take last 8 bytes, assuming value fits in u64)
     let value = u64::from_be_bytes([
         value_bytes[24],
         value_bytes[25],
@@ -467,25 +316,57 @@ fn handle_deposit() {
         return;
     }
 
-    // Read encrypted amount from calldata
-    // Client encrypts the deposit amount under their own public key
+    // Calldata layout:
+    // [4..68]: encrypted amount (64 bytes)
+    // [68..72]: equality proof length (u32, big-endian)
+    // [72..]: SCALE-encoded EqualityProof
     let mut encrypted_bytes = [0u8; 64];
     api::call_data_copy(&mut encrypted_bytes, 4);
     let encrypted_amount = Ciphertext::from_bytes(&encrypted_bytes);
 
-    // Get caller's public key
+    // Read equality proof length
+    let mut proof_len_bytes = [0u8; 4];
+    api::call_data_copy(&mut proof_len_bytes, 68);
+    let proof_len = u32::from_be_bytes(proof_len_bytes) as usize;
+
+    if proof_len > 4096 {
+        // Sanity cap: equality proof should be small
+        revert_with_message(b"Equality proof too large");
+        return;
+    }
+
+    let mut proof_data = alloc::vec![0u8; proof_len];
+    api::call_data_copy(&mut proof_data, 72);
+
+    let equality_proof = match EqualityProof::decode(&mut &proof_data[..]) {
+        Ok(p) => p,
+        Err(_) => {
+            revert_with_message(b"Invalid equality proof encoding");
+            return;
+        }
+    };
+
     let pubkey_key = make_pubkey_key(&caller);
     let mut pubkey_bytes = [0u8; 32];
     if !storage_get(&pubkey_key, &mut pubkey_bytes) {
         revert_with_message(b"Register pubkey first");
         return;
     }
+    let pubkey = PublicKey::from_bytes(pubkey_bytes);
 
-    // TODO: Verify range proof that encrypted amount = deposit value
-    // This would prove: decrypt(encrypted_amount) == value
-    // For now, we trust the client (should be fixed for production)
+    // Verify equality proof: encrypted_amount encodes `value`
+    match equality_proof.verify(value, &encrypted_amount, &pubkey) {
+        Ok(true) => {}
+        Ok(false) => {
+            revert_with_message(b"Equality proof invalid");
+            return;
+        }
+        Err(_) => {
+            revert_with_message(b"Equality proof error");
+            return;
+        }
+    }
 
-    // Get current balance
     let balance_key = make_balance_key(&caller);
     let mut balance_bytes = [0u8; 128];
     let current_balance = if storage_get(&balance_key, &mut balance_bytes) {
@@ -494,7 +375,6 @@ fn handle_deposit() {
         Ciphertext::zero()
     };
 
-    // Add deposit to balance (homomorphic addition!)
     let new_balance = match current_balance.add_encrypted(&encrypted_amount) {
         Ok(ct) => ct,
         Err(_) => {
@@ -505,70 +385,7 @@ fn handle_deposit() {
 
     storage_set(&balance_key, &new_balance.encode());
 
-    api::return_value(ReturnFlags::empty(), &[1u8]);
-}
-
-/// Get an account's encrypted balance
-///
-/// Returns the raw ciphertext - only the account holder can decrypt it.
-fn handle_get_balance() {
-    // Read account address from calldata (20 bytes after selector)
-    let mut account = [0u8; 20];
-    api::call_data_copy(&mut account, 4);
-
-    let balance_key = make_balance_key(&account);
-    let mut balance_bytes = [0u8; 128];
-
-    let balance = if storage_get(&balance_key, &mut balance_bytes) {
-        balance_bytes.to_vec()
-    } else {
-        // Return zero balance for unregistered accounts
-        Ciphertext::zero().encode()
-    };
-
-    api::return_value(ReturnFlags::empty(), &balance);
-}
-
-/// Mint new tokens (owner only)
-///
-/// # Access Control
-/// Only the contract owner can call this function.
-///
-/// # Security Note
-/// The owner can mint arbitrary amounts but CANNOT see existing balances.
-fn handle_mint() {
-    // Access control: owner only
-    require_owner();
-
-    // Read recipient and encrypted amount
-    let mut recipient = [0u8; 20];
-    api::call_data_copy(&mut recipient, 4);
-
-    let mut amount_bytes = [0u8; 64];
-    api::call_data_copy(&mut amount_bytes, 24);
-    let encrypted_amount = Ciphertext::from_bytes(&amount_bytes);
-
-    // Get current balance
-    let balance_key = make_balance_key(&recipient);
-    let mut balance_bytes = [0u8; 128];
-    let current_balance = if storage_get(&balance_key, &mut balance_bytes) {
-        Ciphertext::decode(&mut &balance_bytes[..]).unwrap_or_else(|_| Ciphertext::zero())
-    } else {
-        Ciphertext::zero()
-    };
-
-    // Add minted amount
-    let new_balance = match current_balance.add_encrypted(&encrypted_amount) {
-        Ok(ct) => ct,
-        Err(_) => {
-            revert_with_message(b"Mint add failed");
-            return;
-        }
-    };
-
-    storage_set(&balance_key, &new_balance.encode());
-
-    // Update total supply
+    // Update encrypted total supply as well (deposit mints into the shielded pool)
     let mut supply_bytes = [0u8; 128];
     let current_supply = if storage_get(&TOTAL_SUPPLY_KEY, &mut supply_bytes) {
         Ciphertext::decode(&mut &supply_bytes[..]).unwrap_or_else(|_| Ciphertext::zero())
@@ -589,17 +406,76 @@ fn handle_mint() {
     api::return_value(ReturnFlags::empty(), &[1u8]);
 }
 
-/// Transfer contract ownership (owner only)
-///
-/// # Access Control
-/// Only the current owner can transfer ownership.
+fn handle_get_balance() {
+    let mut account = [0u8; 20];
+    api::call_data_copy(&mut account, 4);
+
+    let balance_key = make_balance_key(&account);
+    let mut balance_bytes = [0u8; 128];
+
+    let balance = if storage_get(&balance_key, &mut balance_bytes) {
+        balance_bytes.to_vec()
+    } else {
+        Ciphertext::zero().encode()
+    };
+
+    api::return_value(ReturnFlags::empty(), &balance);
+}
+
+fn handle_mint() {
+    require_owner();
+
+    let mut recipient = [0u8; 20];
+    api::call_data_copy(&mut recipient, 4);
+
+    let mut amount_bytes = [0u8; 64];
+    api::call_data_copy(&mut amount_bytes, 24);
+    let encrypted_amount = Ciphertext::from_bytes(&amount_bytes);
+
+    let balance_key = make_balance_key(&recipient);
+    let mut balance_bytes = [0u8; 128];
+    let current_balance = if storage_get(&balance_key, &mut balance_bytes) {
+        Ciphertext::decode(&mut &balance_bytes[..]).unwrap_or_else(|_| Ciphertext::zero())
+    } else {
+        Ciphertext::zero()
+    };
+
+    let new_balance = match current_balance.add_encrypted(&encrypted_amount) {
+        Ok(ct) => ct,
+        Err(_) => {
+            revert_with_message(b"Mint add failed");
+            return;
+        }
+    };
+
+    storage_set(&balance_key, &new_balance.encode());
+
+    let mut supply_bytes = [0u8; 128];
+    let current_supply = if storage_get(&TOTAL_SUPPLY_KEY, &mut supply_bytes) {
+        Ciphertext::decode(&mut &supply_bytes[..]).unwrap_or_else(|_| Ciphertext::zero())
+    } else {
+        Ciphertext::zero()
+    };
+
+    let new_supply = match current_supply.add_encrypted(&encrypted_amount) {
+        Ok(ct) => ct,
+        Err(_) => {
+            revert_with_message(b"Supply add failed");
+            return;
+        }
+    };
+
+    storage_set(&TOTAL_SUPPLY_KEY, &new_supply.encode());
+
+    api::return_value(ReturnFlags::empty(), &[1u8]);
+}
+
 fn handle_transfer_ownership() {
     require_owner();
 
     let mut new_owner = [0u8; 20];
     api::call_data_copy(&mut new_owner, 4);
 
-    // Prevent setting zero address as owner
     if new_owner == [0u8; 20] {
         revert_with_message(b"Invalid new owner");
         return;
@@ -610,19 +486,419 @@ fn handle_transfer_ownership() {
     api::return_value(ReturnFlags::empty(), &[1u8]);
 }
 
-/// Get the current owner
 fn handle_get_owner() {
     let owner = get_owner().unwrap_or([0u8; 20]);
     api::return_value(ReturnFlags::empty(), &owner);
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
+fn handle_total_supply() {
+    let mut supply_bytes = [0u8; 128];
+    let supply = if storage_get(&TOTAL_SUPPLY_KEY, &mut supply_bytes) {
+        supply_bytes.to_vec()
+    } else {
+        Ciphertext::zero().encode()
+    };
+    api::return_value(ReturnFlags::empty(), &supply);
+}
 
-/// Create storage key for balance mapping
-///
-/// Key structure: [BALANCE_PREFIX (4)] | [padding (8)] | [account (20)]
+fn handle_transfer_split() {
+    let mut caller = [0u8; 20];
+    api::caller(&mut caller);
+
+    let sender_balance_key = make_balance_key(&caller);
+    let mut sender_balance_bytes = [0u8; 128];
+    if !storage_get(&sender_balance_key, &mut sender_balance_bytes) {
+        revert_with_message(b"Sender not registered");
+        return;
+    }
+    let mut sender_balance = match Ciphertext::decode(&mut &sender_balance_bytes[..]) {
+        Ok(ct) => ct,
+        Err(_) => {
+            revert_with_message(b"Corrupt balance");
+            return;
+        }
+    };
+
+    let sender_pubkey_key = make_pubkey_key(&caller);
+    let mut sender_pubkey_bytes = [0u8; 32];
+    if !storage_get(&sender_pubkey_key, &mut sender_pubkey_bytes) {
+        revert_with_message(b"Sender pubkey not found");
+        return;
+    }
+    let sender_pubkey = PublicKey::from_bytes(sender_pubkey_bytes);
+    let sender_pubkey_point = match sender_pubkey.to_point() {
+        Ok(p) => p,
+        Err(_) => {
+            revert_with_message(b"Invalid sender pubkey");
+            return;
+        }
+    };
+
+    let mut num_legs_bytes = [0u8; 4];
+    api::call_data_copy(&mut num_legs_bytes, 4);
+    let num_legs = u32::from_be_bytes(num_legs_bytes) as usize;
+
+    let mut offset = 8usize;
+    for _ in 0..num_legs {
+        let mut recipient = [0u8; 20];
+        api::call_data_copy(&mut recipient, offset as u32);
+        offset += 20;
+
+        let mut amount_bytes = [0u8; 64];
+        api::call_data_copy(&mut amount_bytes, offset as u32);
+        let encrypted_amount = Ciphertext::from_bytes(&amount_bytes);
+        offset += 64;
+
+        let mut proof_len_bytes = [0u8; 4];
+        api::call_data_copy(&mut proof_len_bytes, offset as u32);
+        let proof_len = u32::from_be_bytes(proof_len_bytes) as usize;
+        offset += 4;
+
+        let mut proof_data = alloc::vec![0u8; proof_len];
+        api::call_data_copy(&mut proof_data, offset as u32);
+        offset += proof_len;
+
+        let transfer_proof = match TransferProof::decode(&mut &proof_data[..]) {
+            Ok(p) => p,
+            Err(_) => {
+                revert_with_message(b"Invalid proof");
+                return;
+            }
+        };
+
+        // Update sender balance sequentially
+        let next_sender_balance = match sender_balance.sub_encrypted(&encrypted_amount) {
+            Ok(ct) => ct,
+            Err(_) => {
+                revert_with_message(b"Sub failed");
+                return;
+            }
+        };
+
+        // Verify proof for this leg using decompressed key
+        match transfer_proof.verify_with_point(&encrypted_amount, &next_sender_balance, &sender_pubkey_point) {
+            Ok(true) => {}
+            _ => {
+                revert_with_message(b"Leg proof invalid");
+                return;
+            }
+        }
+
+        // Update recipient balance
+        let receiver_balance_key = make_balance_key(&recipient);
+        let mut rb_bytes = [0u8; 128];
+        let rb = if storage_get(&receiver_balance_key, &mut rb_bytes) {
+            Ciphertext::decode(&mut &rb_bytes[..]).unwrap_or_else(|_| Ciphertext::zero())
+        } else {
+            Ciphertext::zero()
+        };
+        let next_rb = rb.add_encrypted(&encrypted_amount).unwrap();
+        storage_set(&receiver_balance_key, &next_rb.encode());
+
+        sender_balance = next_sender_balance;
+    }
+
+    storage_set(&sender_balance_key, &sender_balance.encode());
+    api::return_value(ReturnFlags::empty(), &[1u8]);
+}
+
+fn handle_mint_note() {
+    let mut caller = [0u8; 20];
+    api::caller(&mut caller);
+
+    let mut nullifier = [0u8; 32];
+    api::call_data_copy(&mut nullifier, 4);
+
+    let mut amount_bytes = [0u8; 64];
+    api::call_data_copy(&mut amount_bytes, 36);
+    let encrypted_amount = Ciphertext::from_bytes(&amount_bytes);
+
+    let mut proof_len_bytes = [0u8; 4];
+    api::call_data_copy(&mut proof_len_bytes, 100);
+    let proof_len = u32::from_be_bytes(proof_len_bytes) as usize;
+
+    let mut proof_data = alloc::vec![0u8; proof_len];
+    api::call_data_copy(&mut proof_data, 104);
+
+    let transfer_proof = match TransferProof::decode(&mut &proof_data[..]) {
+        Ok(p) => p,
+        Err(_) => {
+            revert_with_message(b"Invalid proof");
+            return;
+        }
+    };
+
+    let sender_balance_key = make_balance_key(&caller);
+    let mut sb_bytes = [0u8; 128];
+    if !storage_get(&sender_balance_key, &mut sb_bytes) {
+        revert_with_message(b"Sender not found");
+        return;
+    }
+    let sb = match Ciphertext::decode(&mut &sb_bytes[..]) {
+        Ok(ct) => ct,
+        Err(_) => {
+            revert_with_message(b"Corrupt balance");
+            return;
+        }
+    };
+
+    let sender_pubkey_key = make_pubkey_key(&caller);
+    let mut spk_bytes = [0u8; 32];
+    if !storage_get(&sender_pubkey_key, &mut spk_bytes) {
+        revert_with_message(b"Pubkey not found");
+        return;
+    }
+    let spk = PublicKey::from_bytes(spk_bytes);
+
+    let next_sb = match sb.sub_encrypted(&encrypted_amount) {
+        Ok(ct) => ct,
+        Err(_) => {
+            revert_with_message(b"Sub failed");
+            return;
+        }
+    };
+    
+    match transfer_proof.verify(&encrypted_amount, &next_sb, &spk) {
+        Ok(true) => {}
+        _ => {
+            revert_with_message(b"Mint proof invalid");
+            return;
+        }
+    }
+
+    storage_set(&sender_balance_key, &next_sb.encode());
+    
+    // Store the note
+    let note_key = make_note_key(&nullifier);
+    storage_set(&note_key, &encrypted_amount.encode());
+
+    api::return_value(ReturnFlags::empty(), &[1u8]);
+}
+
+fn handle_spend_note() {
+    let mut nullifier = [0u8; 32];
+    api::call_data_copy(&mut nullifier, 4);
+
+    let mut recipient = [0u8; 20];
+    api::call_data_copy(&mut recipient, 36);
+
+    let null_key = make_nullifier_key(&nullifier);
+    if storage_exists(&null_key) {
+        revert_with_message(b"Already spent");
+        return;
+    }
+
+    let note_key = make_note_key(&nullifier);
+    let mut note_bytes = [0u8; 128];
+    if !storage_get(&note_key, &mut note_bytes) {
+        revert_with_message(b"Note not found");
+        return;
+    }
+    let encrypted_amount = match Ciphertext::decode(&mut &note_bytes[..]) {
+        Ok(ct) => ct,
+        Err(_) => {
+            revert_with_message(b"Corrupt note");
+            return;
+        }
+    };
+
+    let receiver_balance_key = make_balance_key(&recipient);
+    let mut rb_bytes = [0u8; 128];
+    let rb = if storage_get(&receiver_balance_key, &mut rb_bytes) {
+        Ciphertext::decode(&mut &rb_bytes[..]).unwrap_or_else(|_| Ciphertext::zero())
+    } else {
+        Ciphertext::zero()
+    };
+
+    let next_rb = rb.add_encrypted(&encrypted_amount).unwrap();
+    storage_set(&receiver_balance_key, &next_rb.encode());
+    storage_set(&null_key, &[1u8]);
+
+    api::return_value(ReturnFlags::empty(), &[1u8]);
+}
+
+fn handle_apply_affine() {
+    let mut caller = [0u8; 20];
+    api::caller(&mut caller);
+
+    let mut ct_old_bytes = [0u8; 64];
+    api::call_data_copy(&mut ct_old_bytes, 4);
+    let ct_old = Ciphertext::from_bytes(&ct_old_bytes);
+
+    let mut ct_new_bytes = [0u8; 64];
+    api::call_data_copy(&mut ct_new_bytes, 68);
+    let ct_new = Ciphertext::from_bytes(&ct_new_bytes);
+
+    let mut a_bytes = [0u8; 8];
+    api::call_data_copy(&mut a_bytes, 132);
+    let a = u64::from_be_bytes(a_bytes);
+
+    let mut b_bytes = [0u8; 8];
+    api::call_data_copy(&mut b_bytes, 140);
+    let b = u64::from_be_bytes(b_bytes);
+
+    let mut proof_len_bytes = [0u8; 4];
+    api::call_data_copy(&mut proof_len_bytes, 148);
+    let proof_len = u32::from_be_bytes(proof_len_bytes) as usize;
+
+    let mut proof_data = alloc::vec![0u8; proof_len];
+    api::call_data_copy(&mut proof_data, 152);
+
+    let proof = match AffineUpdateProof::decode(&mut &proof_data[..]) {
+        Ok(p) => p,
+        Err(_) => {
+            revert_with_message(b"Invalid proof");
+            return;
+        }
+    };
+
+    // Verify the balance matches what the user claims to update
+    let balance_key = make_balance_key(&caller);
+    let mut actual_balance_bytes = [0u8; 128];
+    if !storage_get(&balance_key, &mut actual_balance_bytes) {
+        revert_with_message(b"Balance not found");
+        return;
+    }
+    if actual_balance_bytes[..64] != ct_old_bytes {
+         revert_with_message(b"Mismatch old balance");
+         return;
+    }
+
+    let pubkey_key = make_pubkey_key(&caller);
+    let mut spk_bytes = [0u8; 32];
+    if !storage_get(&pubkey_key, &mut spk_bytes) {
+        revert_with_message(b"Pubkey not found");
+        return;
+    }
+    let spk = PublicKey::from_bytes(spk_bytes);
+
+    match proof.verify(&ct_old, &ct_new, a, b, &spk) {
+        Ok(true) => {}
+        _ => {
+            revert_with_message(b"Affine proof invalid");
+            return;
+        }
+    }
+
+    storage_set(&balance_key, &ct_new.encode());
+    api::return_value(ReturnFlags::empty(), &[1u8]);
+}
+
+fn handle_verify_enrollment() {
+    let mut caller = [0u8; 20];
+    api::caller(&mut caller);
+
+    let pubkey_key = make_pubkey_key(&caller);
+    let mut spk_bytes = [0u8; 32];
+    if !storage_get(&pubkey_key, &mut spk_bytes) {
+        revert_with_message(b"Pubkey not found");
+        return;
+    }
+    let spk = PublicKey::from_bytes(spk_bytes);
+
+    let data_size = api::call_data_size() as usize;
+    if data_size <= 4 {
+        revert_with_message(b"Missing proof data");
+        return;
+    }
+    let proof_len = data_size - 4;
+    let mut proof_data = alloc::vec![0u8; proof_len];
+    api::call_data_copy(&mut proof_data, 4);
+    
+    let enroll = match EnrollmentNullifier::decode(&mut &proof_data[..]) {
+        Ok(e) => e,
+        Err(_) => {
+            revert_with_message(b"Invalid proof encoding");
+            return;
+        }
+    };
+
+    match enroll.verify(&spk) {
+        Ok(true) => api::return_value(ReturnFlags::empty(), &[1u8]),
+        _ => revert_with_message(b"Enrollment proof invalid"),
+    }
+}
+
+fn handle_verify_application() {
+    let mut caller = [0u8; 20];
+    api::caller(&mut caller);
+
+    let pubkey_key = make_pubkey_key(&caller);
+    let mut spk_bytes = [0u8; 32];
+    if !storage_get(&pubkey_key, &mut spk_bytes) {
+        revert_with_message(b"Pubkey not found");
+        return;
+    }
+    let spk = PublicKey::from_bytes(spk_bytes);
+
+    let mut context_id = [0u8; 32];
+    api::call_data_copy(&mut context_id, 4);
+
+    let data_size = api::call_data_size() as usize;
+    if data_size <= 36 {
+        revert_with_message(b"Missing proof data");
+        return;
+    }
+    let proof_len = data_size - 36;
+    let mut proof_data = alloc::vec![0u8; proof_len];
+    api::call_data_copy(&mut proof_data, 36);
+    
+    let app = match ApplicationNullifier::decode(&mut &proof_data[..]) {
+        Ok(a) => a,
+        Err(_) => {
+            revert_with_message(b"Invalid proof encoding");
+            return;
+        }
+    };
+
+    match app.verify(&spk, &context_id) {
+        Ok(true) => api::return_value(ReturnFlags::empty(), &[1u8]),
+        _ => revert_with_message(b"Application proof invalid"),
+    }
+}
+
+fn handle_verify_threshold() {
+    let mut caller = [0u8; 20];
+    api::caller(&mut caller);
+
+    let mut threshold_bytes = [0u8; 8];
+    api::call_data_copy(&mut threshold_bytes, 4);
+    let threshold = u64::from_be_bytes(threshold_bytes);
+
+    let mut proof_len_bytes = [0u8; 4];
+    api::call_data_copy(&mut proof_len_bytes, 12);
+    let proof_len = u32::from_be_bytes(proof_len_bytes) as usize;
+
+    let mut proof_data = alloc::vec![0u8; proof_len];
+    api::call_data_copy(&mut proof_data, 16);
+
+    let proof = match RangeProof::decode(&mut &proof_data[..]) {
+        Ok(p) => p,
+        Err(_) => {
+            revert_with_message(b"Invalid proof encoding");
+            return;
+        }
+    };
+
+    let balance_key = make_balance_key(&caller);
+    let mut balance_bytes = [0u8; 128];
+    if !storage_get(&balance_key, &mut balance_bytes) {
+        revert_with_message(b"Balance not found");
+        return;
+    }
+    let balance_ct = Ciphertext::decode(&mut &balance_bytes[..]).unwrap();
+
+    let pubkey_key = make_pubkey_key(&caller);
+    let mut spk_bytes = [0u8; 32];
+    storage_get(&pubkey_key, &mut spk_bytes);
+    let spk = PublicKey::from_bytes(spk_bytes);
+
+    match proof.verify_greater_than(&balance_ct, threshold, &spk, 64) {
+        Ok(true) => api::return_value(ReturnFlags::empty(), &[1u8]),
+        _ => revert_with_message(b"Threshold proof invalid"),
+    }
+}
+
 fn make_balance_key(account: &[u8; 20]) -> [u8; 32] {
     let mut key = [0u8; 32];
     key[..4].copy_from_slice(&BALANCE_PREFIX);
@@ -630,9 +906,6 @@ fn make_balance_key(account: &[u8; 20]) -> [u8; 32] {
     key
 }
 
-/// Create storage key for public key mapping
-///
-/// Key structure: [PUBKEY_PREFIX (4)] | [padding (8)] | [account (20)]
 fn make_pubkey_key(account: &[u8; 20]) -> [u8; 32] {
     let mut key = [0u8; 32];
     key[..4].copy_from_slice(&PUBKEY_PREFIX);
@@ -640,7 +913,22 @@ fn make_pubkey_key(account: &[u8; 20]) -> [u8; 32] {
     key
 }
 
-/// Revert with an error message
+fn make_note_key(nullifier: &[u8; 32]) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    key[..4].copy_from_slice(&NOTE_PREFIX);
+    key[4..].copy_from_slice(&nullifier[4..]);
+    key
+}
+
+fn make_nullifier_key(nullifier: &[u8; 32]) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    key[..4].copy_from_slice(&NULLIFIER_PREFIX);
+    key[4..].copy_from_slice(&nullifier[4..]);
+    key
+}
+
 fn revert_with_message(msg: &[u8]) {
     api::return_value(ReturnFlags::REVERT, msg);
 }
+
+

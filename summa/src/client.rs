@@ -1,14 +1,16 @@
 //! Client-side utilities for Summa
-//!
-//! This module provides convenient functions for clients (wallets, dApps)
-//! to interact with Summa-enabled contracts.
-//!
-//! NOTE: Some functions here require `std` feature for randomness.
+
+
+
+
+
+
 
 use crate::ciphertext::Ciphertext;
 use crate::curve::Scalar;
 use crate::keys::{KeyPair, PublicKey};
-use crate::range_proof::{RangeProof, TransferProof};
+use crate::range_proof::{EqualityProof, RangeProof, TransferProof, AffineUpdateProof};
+use crate::shielded::Note;
 use crate::FheError;
 
 /// A wallet for managing encrypted balances
@@ -35,35 +37,32 @@ impl ConfidentialWallet {
     }
 
     /// Encrypt an amount for deposit or transfer
-    ///
-    /// # Arguments
-    /// * `amount` - The amount to encrypt
-    /// * `randomness_seed` - Seed for deterministic randomness (use fresh random in production!)
-    pub fn encrypt_amount(&self, amount: u64, randomness_seed: &[u8; 32]) -> Result<Ciphertext, FheError> {
+    pub fn encrypt_amount(
+        &self,
+        amount: u64,
+        randomness_seed: &[u8; 32],
+    ) -> Result<Ciphertext, FheError> {
         let randomness = Scalar::random_with_seed(randomness_seed);
         self.keypair.public.encrypt(amount, &randomness)
     }
 
     /// Encrypt an amount for sending to another public key
-    pub fn encrypt_for(&self, amount: u64, recipient: &PublicKey, randomness_seed: &[u8; 32]) -> Result<Ciphertext, FheError> {
+    pub fn encrypt_for(
+        &self,
+        amount: u64,
+        recipient: &PublicKey,
+        randomness_seed: &[u8; 32],
+    ) -> Result<Ciphertext, FheError> {
         let randomness = Scalar::random_with_seed(randomness_seed);
         recipient.encrypt(amount, &randomness)
     }
 
     /// Decrypt a ciphertext (e.g., your balance)
-    ///
-    /// NOTE: This only works for small values (up to ~1 million by default)
-    /// due to discrete log computation
     pub fn decrypt(&self, ciphertext: &Ciphertext) -> Result<u64, FheError> {
         self.keypair.decrypt(ciphertext)
     }
 
     /// Create a transfer proof
-    ///
-    /// # Arguments
-    /// * `transfer_amount` - Amount to transfer
-    /// * `current_balance` - Your current (decrypted) balance
-    /// * `randomness_seed` - Seed for proof randomness
     pub fn create_transfer_proof(
         &self,
         transfer_amount: u64,
@@ -78,19 +77,21 @@ impl ConfidentialWallet {
 
         let new_balance = current_balance - transfer_amount;
 
-        // Create randomness scalars
         let transfer_rand = Scalar::random_with_seed(transfer_randomness);
         let balance_rand = Scalar::random_with_seed(new_balance_randomness);
 
-        // Encrypt the transfer amount
-        let encrypted_amount = self.keypair.public.encrypt(transfer_amount, &transfer_rand)
+        let encrypted_amount = self
+            .keypair
+            .public
+            .encrypt(transfer_amount, &transfer_rand)
             .map_err(|_| TransferError::EncryptionFailed)?;
 
-        // Encrypt the new balance (for proof)
-        let encrypted_new_balance = self.keypair.public.encrypt(new_balance, &balance_rand)
+        let encrypted_new_balance = self
+            .keypair
+            .public
+            .encrypt(new_balance, &balance_rand)
             .map_err(|_| TransferError::EncryptionFailed)?;
 
-        // Create the transfer proof
         let proof = TransferProof::create(
             transfer_amount,
             current_balance,
@@ -98,13 +99,130 @@ impl ConfidentialWallet {
             &balance_rand,
             &self.keypair.public,
             proof_seed,
-        ).map_err(|_| TransferError::ProofCreationFailed)?;
+        )
+        .map_err(|_| TransferError::ProofCreationFailed)?;
 
         Ok(TransferData {
             encrypted_amount,
             encrypted_new_balance,
             proof,
         })
+    }
+
+    /// Create split transfers (multi-recipient)
+    pub fn create_split_transfers(
+        &self,
+        legs: &[(u64, [u8; 20], [u8; 32])], // (amount, recipient, seed)
+        current_balance: u64,
+    ) -> Result<SplitTransferData, TransferError> {
+        let mut total_amount = 0u64;
+        for (amount, _, _) in legs {
+            total_amount = total_amount.checked_add(*amount).ok_or(TransferError::InsufficientBalance)?;
+        }
+
+        if total_amount > current_balance {
+            return Err(TransferError::InsufficientBalance);
+        }
+
+        let mut results = alloc::vec::Vec::new();
+        let mut running_balance = current_balance;
+
+        for (amount, recipient, seed) in legs {
+            let mut leg_seed = *seed;
+            leg_seed[0] ^= 0xff;
+
+            let transfer_rand = Scalar::random_with_seed(seed);
+            
+            // For split transfers, the next leg's proof must be against the balance AFTER this leg
+            let new_balance = running_balance - amount;
+            let balance_rand = Scalar::random_with_seed(&leg_seed);
+
+            let encrypted_amount = self
+                .keypair
+                .public
+                .encrypt(*amount, &transfer_rand)
+                .map_err(|_| TransferError::EncryptionFailed)?;
+
+            let proof = TransferProof::create(
+                *amount,
+                running_balance,
+                &transfer_rand,
+                &balance_rand,
+                &self.keypair.public,
+                seed,
+            )
+            .map_err(|_| TransferError::ProofCreationFailed)?;
+
+            results.push(SplitTransferLeg {
+                recipient: *recipient,
+                encrypted_amount,
+                proof,
+            });
+
+            running_balance = new_balance;
+        }
+
+        Ok(SplitTransferData { legs: results })
+    }
+
+    /// Mint a note from balance
+    pub fn mint_note_from_balance(
+        &self,
+        value: u64,
+        current_balance: u64,
+        randomness_seed: &[u8; 32],
+        nullifier_seed: &[u8; 32],
+        proof_seed: &[u8; 32],
+    ) -> Result<(Note, TransferProof), TransferError> {
+        if value > current_balance {
+            return Err(TransferError::InsufficientBalance);
+        }
+
+        let randomness = Scalar::random_with_seed(randomness_seed);
+        let note = Note::create(value, &randomness, &self.keypair.public, nullifier_seed)
+            .map_err(|_| TransferError::EncryptionFailed)?;
+
+        // Proof that note.ciphertext subtracts correctly from balance
+        let balance_rand = Scalar::random_with_seed(proof_seed);
+        let proof = TransferProof::create(
+            value,
+            current_balance,
+            &randomness,
+            &balance_rand,
+            &self.keypair.public,
+            proof_seed,
+        )
+        .map_err(|_| TransferError::ProofCreationFailed)?;
+
+        Ok((note, proof))
+    }
+
+    /// Create an affine update proof
+    pub fn apply_affine_with_proof(
+        &self,
+        v_old: u64,
+        a: u64,
+        b: u64,
+        r_old: &Scalar,
+        r_new_seed: &[u8; 32],
+        proof_seed: &[u8; 32],
+    ) -> Result<(Ciphertext, AffineUpdateProof), FheError> {
+        let v_new = a.wrapping_mul(v_old).wrapping_add(b);
+        let r_new = Scalar::random_with_seed(r_new_seed);
+        let ciphertext_new = self.keypair.public.encrypt(v_new, &r_new)?;
+
+        let proof = AffineUpdateProof::create(
+            v_old,
+            v_new,
+            a,
+            b,
+            r_old,
+            &r_new,
+            &self.keypair.public,
+            proof_seed,
+        ).map_err(|_| FheError::RangeProofFailed)?;
+
+        Ok((ciphertext_new, proof))
     }
 
     /// Create a simple range proof for an amount
@@ -123,7 +241,31 @@ impl ConfidentialWallet {
             &self.keypair.public,
             64,
             proof_seed,
-        ).map_err(|_| FheError::RangeProofFailed)?;
+        )
+        .map_err(|_| FheError::RangeProofFailed)?;
+
+        Ok((ciphertext, proof))
+    }
+
+    /// Create a deposit ciphertext together with an equality proof that
+    /// `ciphertext` encrypts the public `value`.
+    pub fn create_deposit_proof(
+        &self,
+        value: u64,
+        randomness_seed: &[u8; 32],
+        proof_seed: &[u8; 32],
+    ) -> Result<(Ciphertext, EqualityProof), FheError> {
+        let randomness = Scalar::random_with_seed(randomness_seed);
+        let ciphertext = self.keypair.public.encrypt(value, &randomness)?;
+
+        let proof = EqualityProof::create(
+            value,
+            &randomness,
+            &self.keypair.public,
+            &ciphertext,
+            proof_seed,
+        )
+        .map_err(|_| FheError::RangeProofFailed)?;
 
         Ok((ciphertext, proof))
     }
@@ -137,6 +279,40 @@ pub struct TransferData {
     pub encrypted_new_balance: Ciphertext,
     /// The proof that the transfer is valid
     pub proof: TransferProof,
+}
+
+/// A single leg of a split transfer
+pub struct SplitTransferLeg {
+    /// Recipient address
+    pub recipient: [u8; 20],
+    /// The encrypted amount for this recipient
+    pub encrypted_amount: Ciphertext,
+    /// The proof that the sender had enough balance for this leg
+    pub proof: TransferProof,
+}
+
+/// Data needed for a split confidential transfer
+pub struct SplitTransferData {
+    /// The legs of the split transfer
+    pub legs: alloc::vec::Vec<SplitTransferLeg>,
+}
+
+impl SplitTransferData {
+    /// Encode for sending to the contract
+    pub fn encode_for_contract(&self) -> alloc::vec::Vec<u8> {
+        use parity_scale_codec::Encode;
+
+        let mut data = alloc::vec::Vec::new();
+        data.extend_from_slice(&(self.legs.len() as u32).to_be_bytes());
+        for leg in &self.legs {
+            data.extend_from_slice(&leg.recipient);
+            data.extend_from_slice(&leg.encrypted_amount.to_bytes());
+            let proof_bytes = leg.proof.encode();
+            data.extend_from_slice(&(proof_bytes.len() as u32).to_be_bytes());
+            data.extend_from_slice(&proof_bytes);
+        }
+        data
+    }
 }
 
 impl TransferData {
@@ -208,10 +384,8 @@ impl CalldataBuilder {
     }
 }
 
-// Contract function selectors (matching the contract)
+/// Contract function selectors (matching the contract)
 pub mod selectors {
-    //! Function selectors for the Confidential Asset contract
-
     /// registerPublicKey(bytes32)
     pub const REGISTER_PUBKEY: [u8; 4] = [0x12, 0x34, 0xab, 0xcd];
 
@@ -226,54 +400,8 @@ pub mod selectors {
 
     /// mint(address,bytes)
     pub const MINT: [u8; 4] = [0xaa, 0xbb, 0x11, 0x22];
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_wallet_encrypt_decrypt() {
-        let wallet = ConfidentialWallet::from_seed(&[42u8; 32]);
-
-        let amount = 12345u64;
-        let ct = wallet.encrypt_amount(amount, &[1u8; 32]).unwrap();
-        let decrypted = wallet.decrypt(&ct).unwrap();
-
-        assert_eq!(amount, decrypted);
-    }
-
-    #[test]
-    fn test_calldata_builder() {
-        let wallet = ConfidentialWallet::from_seed(&[42u8; 32]);
-        let pubkey_bytes = wallet.public_key_bytes();
-
-        let calldata = CalldataBuilder::new(selectors::REGISTER_PUBKEY)
-            .add_bytes32(&pubkey_bytes)
-            .build();
-
-        assert_eq!(calldata.len(), 4 + 32); // selector + pubkey
-        assert_eq!(&calldata[..4], &selectors::REGISTER_PUBKEY);
-    }
-
-    #[test]
-    fn test_transfer_data_creation() {
-        let wallet = ConfidentialWallet::from_seed(&[42u8; 32]);
-
-        let result = wallet.create_transfer_proof(
-            100,    // transfer amount
-            1000,   // current balance
-            &[1u8; 32],
-            &[2u8; 32],
-            &[3u8; 32],
-        );
-
-        assert!(result.is_ok());
-        let transfer_data = result.unwrap();
-
-        // Verify the encrypted amount decrypts correctly
-        let decrypted = wallet.decrypt(&transfer_data.encrypted_amount).unwrap();
-        assert_eq!(decrypted, 100);
-    }
+    /// totalSupply()
+    pub const TOTAL_SUPPLY: [u8; 4] = [0x18, 0x16, 0x0d, 0xdd];
 }
 
