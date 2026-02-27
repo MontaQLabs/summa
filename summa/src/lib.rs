@@ -4,8 +4,8 @@
 
 //! Summa - Homomorphic Encryption for Polkadot PVM
 //!
-//! A Somewhat Homomorphic Encryption (SHE) library using Twisted ElGamal
-//! on the JubJub curve, optimized for RISC-V/PVM execution.
+//! Internal module version of the Summa library, embedded inside the
+//! contract crate so we can reuse the existing build configuration.
 
 #[cfg(not(test))]
 extern crate alloc;

@@ -61,7 +61,6 @@ Without range proofs, an attacker could send `Enc(-1000)` and underflow their ba
 
 - **DLEQ Proofs**: Proves that two elliptic curve points share the same discrete log. Used for nullifier verification.
 - **Shielded Notes**: Support for UTXO-style private transfers using nullifiers to prevent double-spending.
-- **Veil PoP (Proof of Personhood)**: Anonymous enrollment and application verification using one-out-of-many proofs and nullifiers.
 
 ---
 
@@ -83,9 +82,7 @@ let balance = wallet.decrypt(&encrypted_balance)?;
 
 Move from account-based to note-based privacy. Spend notes anonymously by revealing nullifiers.
 
-### 3. Veil PoP: Anonymous Credentials
 
-Enroll in a system and later prove membership and application-specific "one-time-use" status without revealing your identity.
 
 ### 4. Sealed-Bid Voting
 
@@ -152,8 +149,6 @@ summa/
 ├── docs/
 │   ├── TECHNICAL.md             # Detailed technical documentation
 │   ├── benchmark.md             # Performance benchmarks
-│   ├── veil.md                  # Veil PoP technical details
-│   └── current.md               # Current development status
 ├── DEPLOYED.md                   # Live deployment addresses
 ├── deploy.sh                     # Multi-network deployment script
 └── Makefile
@@ -170,8 +165,6 @@ Detailed benchmarks are available in [docs/benchmark.md](docs/benchmark.md).
 | Encryption (client) | N/A | ~2ms |
 | Homomorphic Add | ~20,000 | ~0.05ms |
 | Range Proof Verify | ~500,000 | ~12ms |
-| Enrollment Proof | ~1,200,000 | ~25ms |
-| Application Proof | ~1,500,000 | ~32ms |
 
 ---
 
